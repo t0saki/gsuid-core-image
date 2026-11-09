@@ -1,0 +1,120 @@
+name: build
+
+on:
+  schedule:
+    - cron: "0 20 * * 0"
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+  actions: write
+
+env:
+  IMAGE: ghcr.io/t0saki/gsuid-core
+  BASE: ghcr.io/t0saki/gsuid-core-base
+  UPSTREAM: Genshin-bots/gsuid_core
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # persist-credentials: false keeps the job token out of src/.git/config,
+      # which is copied into the image.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          path: src
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Resolve versions
+        id: meta
+        run: |
+          sha=$(git -C src rev-parse --short=12 HEAD)
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' src/pyproject.toml | head -1)
+          playwright=$(grep -A1 '^name = "playwright"$' src/uv.lock | sed -n 's/^version = "\(.*\)"/\1/p')
+          base_key=$( (cat src/docker/base/Dockerfile; echo "$playwright") | sha256sum | cut -c1-12)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "playwright=$playwright" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE:$base_key" >> "$GITHUB_OUTPUT"
+          echo "upstream $sha version $version playwright $playwright base $base_key"
+
+      - name: Skip scheduled build if this commit is already published
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] \
+            && docker manifest inspect "$IMAGE:sha-${{ steps.meta.outputs.sha }}" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build base image if missing
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          base="${{ steps.meta.outputs.base }}"
+          if docker manifest inspect "$base" >/dev/null 2>&1; then
+            docker pull "$base"
+          else
+            docker build -t "$base" \
+              --build-arg GSCORE_PLAYWRIGHT_VERSION="${{ steps.meta.outputs.playwright }}" \
+              --label org.opencontainers.image.source="https://github.com/${{ github.repository }}" \
+              src/docker/base
+            docker push "$base"
+          fi
+
+      - name: Build image
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          docker build -t "$IMAGE:sha-${{ steps.meta.outputs.sha }}" \
+            --build-arg BASE_IMAGE="${{ steps.meta.outputs.base }}" \
+            --label org.opencontainers.image.source="https://github.com/${{ github.repository }}" \
+            --label org.opencontainers.image.revision="${{ steps.meta.outputs.sha }}" \
+            --label org.opencontainers.image.version="${{ steps.meta.outputs.version }}" \
+            .
+
+      - name: Smoke test
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          image="$IMAGE:sha-${{ steps.meta.outputs.sha }}"
+          if docker run --rm "$image" git config --local --get-regexp 'extraheader' ; then
+            echo "::error::credentials found in the image's .git/config"; exit 1
+          fi
+          docker run -d --name smoke -p 8765:8765 "$image"
+          for i in $(seq 1 90); do
+            if curl -s -o /dev/null -m 3 http://127.0.0.1:8765/; then
+              echo "core is serving after $((i * 2))s"; docker logs --tail 15 smoke; exit 0
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' smoke)" != "true" ]; then break; fi
+            sleep 2
+          done
+          echo "::error::core did not start"; docker logs --tail 80 smoke; exit 1
+
+      - name: Push tags
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          sha_tag="$IMAGE:sha-${{ steps.meta.outputs.sha }}"
+          docker push "$sha_tag"
+          for tag in latest "v${{ steps.meta.outputs.version }}"; do
+            docker tag "$sha_tag" "$IMAGE:$tag"
+            docker push "$IMAGE:$tag"
+          done
+
+      # GitHub disables scheduled workflows after 60 days without repo activity.
+      - name: Keep the schedule enabled
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/build.yml/enable"
